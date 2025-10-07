@@ -1,0 +1,15 @@
+# Ignore Python cache and environment
+__pycache__/
+*.pyc
+.venv/
+
+# Ignore data and model files
+data/
+vectorstore/
+*.db
+*.json
+
+# Ignore system / editor files
+.DS_Store
+*.log
+.env
