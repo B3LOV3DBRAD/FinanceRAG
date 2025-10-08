@@ -1,38 +1,70 @@
-# src/retriever.py
+# src/retriever.py – Lazy Batch BM25 (safe for large corpora)
 
-import os
+import os, random
+from langchain_community.document_loaders import TextLoader
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI
-from config import OPENAI_API_KEY, CHAT_MODEL, VECTOR_DIR
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from config import OPENAI_API_KEY, CHAT_MODEL, DATA_DIR, VECTOR_DIR
 
-# --- Step 1: Load vectorstore ---
+# --- Load vectorstore (semantic) ---
 def load_vectorstore():
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = Chroma(persist_directory=VECTOR_DIR, embedding_function=embeddings)
-    return vectorstore
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        openai_api_key=OPENAI_API_KEY
+    )
+    return Chroma(persist_directory=VECTOR_DIR, embedding_function=embeddings)
 
 
-# --- Step 2: Retrieve relevant chunks ---
-def retrieve_context(question, k=3):
+# --- Lightweight keyword retriever (lazy batch) ---
+def make_keyword_retriever(data_dir, sample_size=400):
+    """Loads a random sample of 10-Ks for keyword search (to save RAM)."""
+    txts = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
+    sample = random.sample(txts, min(sample_size, len(txts)))
+
+    docs = []
+    for name in sample:
+        path = os.path.join(data_dir, name)
+        try:
+            docs.extend(TextLoader(path, encoding="utf-8").load())
+        except Exception:
+            pass
+
+    retriever = BM25Retriever.from_documents(docs)
+    retriever.k = 5
+    return retriever
+
+
+# --- Combined retrieval (semantic + keyword) ---
+def retrieve_context(question, k=5):
+    print("🔍 Retrieving relevant chunks...")
+
+    # Semantic retrieval
     vectorstore = load_vectorstore()
-    docs = vectorstore.similarity_search(question, k=k)
-    print(f"Retrieved {len(docs)} relevant chunks:\n")
-    for i, doc in enumerate(docs, start=1):
-        print(f"[{i}] {doc.page_content[:200]}...\n")
-    return docs
+    semantic_docs = vectorstore.similarity_search(question, k=k)
+
+    # Keyword retrieval on a small random batch
+    keyword_retriever = make_keyword_retriever(DATA_DIR, sample_size=400)
+    keyword_docs = keyword_retriever.get_relevant_documents(question)
+
+    # Merge results
+    combined = semantic_docs + keyword_docs
+    print(f"✅ Retrieved {len(combined)} total chunks (semantic + keyword).")
+
+    for i, doc in enumerate(combined[:5], 1):
+        snippet = doc.page_content[:200].replace("\n", " ")
+        print(f"[{i}] {snippet}...\n")
+
+    return combined
 
 
-# --- Step 3: Generate an answer using the LLM ---
+# --- Generate answer using GPT ---
 def generate_answer(question, docs):
-    # Combine the text of the top retrieved documents
     context = "\n\n".join([doc.page_content for doc in docs])
-
-    # Build the prompt for the model
     prompt = f"""
     You are a financial analysis assistant.
-    Use the CONTEXT below to answer the QUESTION.
-    Be concise and cite which source the info came from if possible.
+    Use the CONTEXT below to answer the QUESTION accurately and concisely.
+    If possible, cite which company or filing the info came from.
 
     CONTEXT:
     {context}
@@ -43,20 +75,16 @@ def generate_answer(question, docs):
     ANSWER:
     """
 
-    # Option 1: If you have OpenAI credits, use GPT
     try:
         llm = ChatOpenAI(model=CHAT_MODEL, openai_api_key=OPENAI_API_KEY)
         response = llm.invoke(prompt)
-        answer = response.content
+        return response.content
     except Exception as e:
-        # Option 2: Fallback if no credits
-        print("OpenAI quota issue, falling back to local model (simulated response).")
-        answer = "Based on the context, here’s a summarized response:\n\n" + context[:400] + "..."
-
-    return answer
+        print(f"⚠️ OpenAI issue: {e}")
+        return "Based on the context, here’s a summarized response:\n\n" + context[:400] + "..."
 
 
-# --- Step 4: Ask a question ---
+# --- Entry point ---
 def ask_question(question):
     docs = retrieve_context(question)
     answer = generate_answer(question, docs)
@@ -65,5 +93,4 @@ def ask_question(question):
 
 
 if __name__ == "__main__":
-    # Example query
-    ask_question("What was Apple's returns last quarter?")
+    ask_question("Which tech company had the highest revenue growth last year?")
