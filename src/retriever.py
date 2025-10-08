@@ -33,68 +33,38 @@ def generate_answer(question, docs):
     from langchain.prompts import PromptTemplate
     from langchain.chains import LLMChain
 
-    # ---------- Combine & sanitize context ----------
-    unique_texts = []
-    for d in docs:
-        txt = getattr(d, "page_content", str(d))
-        if txt not in unique_texts:
-            unique_texts.append(txt)
-    context = "\n\n".join(unique_texts)
+    # --- combine and lightly clean messy context ---
+    raw = "\n".join(getattr(d, "page_content", str(d)) for d in docs)
+    # strip obvious tags / identifiers but keep words
+    cleaned = re.sub(r"<[^>]+>", " ", raw)
+    cleaned = re.sub(r"[A-Za-z0-9_-]+:[A-Za-z0-9_-]+", " ", cleaned)   # remove xbrl/us-gaap: tags
+    cleaned = re.sub(r"[^A-Za-z0-9.,%$() \n]", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    context = cleaned[:8000]   # keep it short enough
 
-    context = re.sub(r"\s{2,}", " ", context)
-    context = context.replace("*", "").replace("_", "")
-
-    # ---------- Universal Prompt ----------
+    # --- simple reasoning prompt ---
     template = """
-You are **FinanceRAG**, an expert AI analyst that interprets SEC 10-K filings.
+You are FinanceRAG, an AI financial analyst reading SEC 10-K filings.
 
-Your task: Answer the QUESTION using only the information in CONTEXT.
-If the question is about:
-- **Performance / Returns** → extract quantitative data like revenue, growth, or total return.
-- **Risks / Challenges / Outlook** → summarize qualitative risk factors and management commentary.
-- **Comparisons** → describe relative performance or risk positioning among companies.
+Use the CONTEXT to answer the QUESTION in 3-6 plain English sentences.
+• If numbers or performance clues appear, summarize them clearly.
+• If qualitative risks or themes appear, summarize them clearly.
+• Do not say "no relevant details" unless absolutely nothing relates to the question.
+• Ignore gibberish or codes like "us-gaap:" or "xbrli:".
 
-Follow these formatting rules:
-
-## Key Facts
-- One bullet per company or relevant topic.
-- Clean and readable; fix spacing (e.g., “100onDecember31,2019” → “100 on December 31, 2019”).
-- When discussing qualitative topics (like risk), summarize the main ideas in 1–2 short sentences.
-- When discussing quantitative metrics (like returns or revenue), include clean numbers.
-
-## Summary
-Write 1–3 sentences summarizing the key takeaway or comparison.
-
-If there’s truly no relevant data, return:
-**No relevant details were found in the provided filings.**
+QUESTION: {question}
 
 CONTEXT:
 {context}
 
-QUESTION:
-{question}
+Answer:
 """
-
     prompt = PromptTemplate(input_variables=["context", "question"], template=template)
-
-    llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
     chain = LLMChain(prompt=prompt, llm=llm)
     result = chain.run({"context": context, "question": question})
+    return result.strip()
 
-    # ---------- Post-cleanup ----------
-    result = re.sub(r"[*_]+", "", result)
-    result = re.sub(r"([A-Za-z])\s*([A-Za-z])", r"\1\2", result)
-    result = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", result)
-    result = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", result)
-    result = re.sub(r"##\s*Summary", "\n\n## Summary", result)
-    result = re.sub(r"\s{2,}", " ", result)
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    result = result.strip()
-    if not result.startswith("##"):
-        result = "## Key Facts\n" + result
-    if "## Summary" not in result:
-        result += "\n\n## Summary\n(No summary section detected.)"
-    return result
 
 
 
