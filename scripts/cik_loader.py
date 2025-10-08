@@ -6,7 +6,7 @@ OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "company_ciks.json")
 SEC_URL = "https://www.sec.gov/files/company_tickers.json"
 
 def fetch_cik_data():
-    print("🔍 Fetching company list from SEC...")
+    print("Fetching company list from SEC...")
     response = requests.get(SEC_URL, headers={"User-Agent": "FinanceRAG (contact: your_email@example.com)"})
     response.raise_for_status()
     data = response.json()

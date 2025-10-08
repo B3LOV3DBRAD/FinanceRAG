@@ -1,13 +1,11 @@
-# src/retriever.py – Lazy Batch BM25 (safe for large corpora)
+# src/retriever.py
 
-import os, random
-from langchain_community.document_loaders import TextLoader
-from langchain_community.retrievers import BM25Retriever
+import os
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from config import OPENAI_API_KEY, CHAT_MODEL, DATA_DIR, VECTOR_DIR
+from src.config import OPENAI_API_KEY, CHAT_MODEL, VECTOR_DIR
 
-# --- Load vectorstore (semantic) ---
+# --- Load vectorstore ---
 def load_vectorstore():
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
@@ -16,79 +14,100 @@ def load_vectorstore():
     return Chroma(persist_directory=VECTOR_DIR, embedding_function=embeddings)
 
 
-# --- Lightweight keyword retriever (lazy batch) ---
-def make_keyword_retriever(data_dir, sample_size=400):
-    """Loads a random sample of 10-Ks for keyword search (to save RAM)."""
-    txts = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
-    sample = random.sample(txts, min(sample_size, len(txts)))
-
-    docs = []
-    for name in sample:
-        path = os.path.join(data_dir, name)
-        try:
-            docs.extend(TextLoader(path, encoding="utf-8").load())
-        except Exception:
-            pass
-
-    retriever = BM25Retriever.from_documents(docs)
-    retriever.k = 5
-    return retriever
-
-
-# --- Combined retrieval (semantic + keyword) ---
-def retrieve_context(question, k=5):
-    print("🔍 Retrieving relevant chunks...")
-
-    # Semantic retrieval
+# --- Retrieve top chunks ---
+def retrieve_context(question, k=6):
     vectorstore = load_vectorstore()
-    semantic_docs = vectorstore.similarity_search(question, k=k)
+    docs = vectorstore.similarity_search(question, k=k)
 
-    # Keyword retrieval on a small random batch
-    keyword_retriever = make_keyword_retriever(DATA_DIR, sample_size=400)
-    keyword_docs = keyword_retriever.get_relevant_documents(question)
+    print(f"Retrieved {len(docs)} relevant chunks:\n")
+    for i, doc in enumerate(docs, start=1):
+        source = doc.metadata.get("source", "Unknown").split("\\")[-1]
+        print(f"[{i}] ({source}) — {doc.page_content[:200]}...\n")
 
-    # Merge results
-    combined = semantic_docs + keyword_docs
-    print(f"✅ Retrieved {len(combined)} total chunks (semantic + keyword).")
-
-    for i, doc in enumerate(combined[:5], 1):
-        snippet = doc.page_content[:200].replace("\n", " ")
-        print(f"[{i}] {snippet}...\n")
-
-    return combined
+    return docs
 
 
-# --- Generate answer using GPT ---
 def generate_answer(question, docs):
-    context = "\n\n".join([doc.page_content for doc in docs])
-    prompt = f"""
-    You are a financial analysis assistant.
-    Use the CONTEXT below to answer the QUESTION accurately and concisely.
-    If possible, cite which company or filing the info came from.
+    import re
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import PromptTemplate
+    from langchain.chains import LLMChain
 
-    CONTEXT:
-    {context}
+    # ---------- Combine & sanitize context ----------
+    unique_texts = []
+    for d in docs:
+        txt = getattr(d, "page_content", str(d))
+        if txt not in unique_texts:
+            unique_texts.append(txt)
+    context = "\n\n".join(unique_texts)
 
-    QUESTION:
-    {question}
+    context = re.sub(r"\s{2,}", " ", context)
+    context = context.replace("*", "").replace("_", "")
 
-    ANSWER:
-    """
+    # ---------- Universal Prompt ----------
+    template = """
+You are **FinanceRAG**, an expert AI analyst that interprets SEC 10-K filings.
 
-    try:
-        llm = ChatOpenAI(model=CHAT_MODEL, openai_api_key=OPENAI_API_KEY)
-        response = llm.invoke(prompt)
-        return response.content
-    except Exception as e:
-        print(f"⚠️ OpenAI issue: {e}")
-        return "Based on the context, here’s a summarized response:\n\n" + context[:400] + "..."
+Your task: Answer the QUESTION using only the information in CONTEXT.
+If the question is about:
+- **Performance / Returns** → extract quantitative data like revenue, growth, or total return.
+- **Risks / Challenges / Outlook** → summarize qualitative risk factors and management commentary.
+- **Comparisons** → describe relative performance or risk positioning among companies.
+
+Follow these formatting rules:
+
+## Key Facts
+- One bullet per company or relevant topic.
+- Clean and readable; fix spacing (e.g., “100onDecember31,2019” → “100 on December 31, 2019”).
+- When discussing qualitative topics (like risk), summarize the main ideas in 1–2 short sentences.
+- When discussing quantitative metrics (like returns or revenue), include clean numbers.
+
+## Summary
+Write 1–3 sentences summarizing the key takeaway or comparison.
+
+If there’s truly no relevant data, return:
+**No relevant details were found in the provided filings.**
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+"""
+
+    prompt = PromptTemplate(input_variables=["context", "question"], template=template)
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+    chain = LLMChain(prompt=prompt, llm=llm)
+    result = chain.run({"context": context, "question": question})
+
+    # ---------- Post-cleanup ----------
+    result = re.sub(r"[*_]+", "", result)
+    result = re.sub(r"([A-Za-z])\s*([A-Za-z])", r"\1\2", result)
+    result = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", result)
+    result = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", result)
+    result = re.sub(r"##\s*Summary", "\n\n## Summary", result)
+    result = re.sub(r"\s{2,}", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    result = result.strip()
+    if not result.startswith("##"):
+        result = "## Key Facts\n" + result
+    if "## Summary" not in result:
+        result += "\n\n## Summary\n(No summary section detected.)"
+    return result
 
 
-# --- Entry point ---
+
+
+
+
+# --- Main ---
 def ask_question(question):
-    docs = retrieve_context(question)
-    answer = generate_answer(question, docs)
-    print("\nFinal Answer:\n")
+    print("Retrieving relevant chunks...")
+    trimmed_docs = retrieve_context(question)
+    print("Generating analytical answer...\n")
+    answer = generate_answer(question, trimmed_docs)
+    print("Final Answer:\n")
     print(answer)
 
 

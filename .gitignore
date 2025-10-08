@@ -13,3 +13,6 @@ vectorstore/
 .DS_Store
 *.log
 .env
+
+# Ignore config with API keys
+src/config.py
